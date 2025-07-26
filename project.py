@@ -84,6 +84,9 @@ from watchdog.events import FileSystemEventHandler
 # Load environment variables
 load_dotenv()
 
+# Global test mode flag - can be set by tests
+_TEST_MODE = os.getenv('PORTFOLIO_TEST_MODE', 'false').lower() == 'true'
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -153,10 +156,20 @@ class ConfigWatcher(FileSystemEventHandler):
 class SecureAPIClient:
     """Secure REST API client with TLS support for fetching market data."""
     
-    def __init__(self):
-        self.base_url = self._get_required_env('API_BASE_URL')
-        self.api_key = self._get_required_env('API_KEY')
-        self.api_secret = os.getenv('API_SECRET', '')
+    def __init__(self, test_mode: bool = None):
+        self.test_mode = test_mode if test_mode is not None else _TEST_MODE
+        
+        if self.test_mode:
+            # In test mode, use default values if environment variables aren't set
+            self.base_url = os.getenv('API_BASE_URL', 'https://api.example.com')
+            self.api_key = os.getenv('API_KEY', 'test_key')
+            self.api_secret = os.getenv('API_SECRET', 'test_secret')
+        else:
+            # In production mode, require environment variables
+            self.base_url = self._get_required_env('API_BASE_URL')
+            self.api_key = self._get_required_env('API_KEY')
+            self.api_secret = os.getenv('API_SECRET', '')
+        
         self.session = None
         
     def _get_required_env(self, key: str) -> str:
@@ -447,13 +460,20 @@ class AuditLogger:
 class PortfolioService:
     """Main portfolio management service."""
     
-    def __init__(self):
+    def __init__(self, test_mode: bool = None):
+        self.test_mode = test_mode if test_mode is not None else _TEST_MODE
         self.config = self._load_config()
-        self.api_client = SecureAPIClient()
+        self.api_client = SecureAPIClient(test_mode=self.test_mode)
         self.optimizer = PortfolioOptimizer(self.config)
         self.audit_logger = AuditLogger()
         self.price_history = pd.DataFrame()
-        self._setup_config_watcher()
+        
+        # Only setup file watcher in production mode
+        if not self.test_mode:
+            self._setup_config_watcher()
+        else:
+            self.config_observer = None
+            
         self.running = False
         
     def _load_config(self) -> PortfolioConfig:
@@ -628,7 +648,7 @@ class PortfolioService:
         logger.info("Shutting down Portfolio Management Service")
         self.running = False
         
-        if hasattr(self, 'config_observer'):
+        if hasattr(self, 'config_observer') and self.config_observer is not None:
             self.config_observer.stop()
             self.config_observer.join()
             
