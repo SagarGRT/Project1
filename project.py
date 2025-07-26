@@ -11,7 +11,7 @@ and executes rebalancing decisions at configurable intervals.
 SETUP & DEPENDENCIES:
 ====================
 1. Install required packages:
-   pip install requests pandas numpy pypfopt python-dotenv watchdog
+   pip install requests pandas numpy pypfopt python-dotenv watchdog aiohttp
 
 2. Environment Variables (Required):
    - API_BASE_URL: Base URL for the price data API
@@ -72,7 +72,7 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import pandas as pd
-import requests
+import aiohttp
 from dotenv import load_dotenv
 from pypfopt import EfficientFrontier, risk_models, expected_returns
 from pypfopt.exceptions import OptimizationError
@@ -103,7 +103,7 @@ class PortfolioConfig:
     optimization_objective: str = "max_sharpe"  # "max_sharpe" or "target_sharpe"
     target_sharpe_ratio: Optional[float] = None
     rolling_window_periods: int = 60
-    assets: List[str] = None
+    assets: Optional[List[str]] = None  # Fixed: Changed from List[str] = None to Optional[List[str]] = None
     max_weight_per_asset: float = 0.4
     min_weight_per_asset: float = 0.05
     
@@ -156,7 +156,7 @@ class SecureAPIClient:
         self.base_url = self._get_required_env('API_BASE_URL')
         self.api_key = self._get_required_env('API_KEY')
         self.api_secret = os.getenv('API_SECRET', '')
-        self.session = self._create_secure_session()
+        self.session = None
         
     def _get_required_env(self, key: str) -> str:
         """Get required environment variable or raise error."""
@@ -165,27 +165,34 @@ class SecureAPIClient:
             raise ValueError(f"Required environment variable {key} not set")
         return value
         
-    def _create_secure_session(self) -> requests.Session:
-        """Create TLS-secured requests session."""
-        session = requests.Session()
-        
-        # Configure TLS
-        session.verify = True  # Always verify SSL certificates
-        
-        # Optional client certificate authentication
-        cert_path = os.getenv('TLS_CERT_PATH')
-        key_path = os.getenv('TLS_KEY_PATH')
-        if cert_path and key_path:
-            session.cert = (cert_path, key_path)
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create async HTTP session."""
+        if self.session is None or self.session.closed:
+            # Configure TLS
+            ssl_context = ssl.create_default_context()
             
-        # Set security headers
-        session.headers.update({
-            'User-Agent': 'DigitalAssetManager/1.0',
-            'X-API-Key': self.api_key,
-            'Content-Type': 'application/json'
-        })
-        
-        return session
+            # Optional client certificate authentication
+            cert_path = os.getenv('TLS_CERT_PATH')
+            key_path = os.getenv('TLS_KEY_PATH')
+            if cert_path and key_path:
+                ssl_context.load_cert_chain(cert_path, key_path)
+            
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            
+            # Set security headers
+            headers = {
+                'User-Agent': 'DigitalAssetManager/1.0',
+                'X-API-Key': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+            
+        return self.session
         
     def _generate_signature(self, timestamp: str, method: str, path: str, body: str = '') -> str:
         """Generate HMAC signature for API authentication."""
@@ -211,9 +218,11 @@ class SecureAPIClient:
             DataFrame with timestamp index and asset price columns
             
         Raises:
-            requests.RequestException: If API request fails
+            aiohttp.ClientError: If API request fails
             ValueError: If response data is invalid
         """
+        session = await self._get_session()
+        
         try:
             timestamp = str(int(time.time()))
             path = '/api/v1/prices'
@@ -226,15 +235,13 @@ class SecureAPIClient:
                 'X-Signature': signature
             }
             
-            response = self.session.get(
+            async with session.get(
                 f"{self.base_url}{path}",
                 params=params,
-                headers=headers,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            data = response.json()
+                headers=headers
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
             
             # Convert to DataFrame with proper timestamp indexing
             prices_data = []
@@ -255,12 +262,17 @@ class SecureAPIClient:
             logger.info(f"Fetched price data for {len(assets)} assets")
             return df_pivot
             
-        except requests.RequestException as e:
+        except aiohttp.ClientError as e:
             logger.error(f"API request failed: {e}")
             raise
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Invalid API response format: {e}")
             raise ValueError(f"Invalid API response: {e}")
+    
+    async def close(self):
+        """Close the HTTP session."""
+        if self.session and not self.session.closed:
+            await self.session.close()
 
 
 class PortfolioOptimizer:
@@ -497,7 +509,7 @@ class PortfolioService:
             logger.error(f"Failed to fetch price data: {e}")
             raise
             
-    async def execute_rebalancing(self) -> Optional[RebalanceRecord]:
+    def execute_rebalancing(self) -> Optional[RebalanceRecord]:
         """
         Execute portfolio rebalancing and create audit record.
         
@@ -560,8 +572,8 @@ class PortfolioService:
                     # Fetch latest price data
                     await self.fetch_and_store_prices()
                     
-                    # Execute rebalancing
-                    record = await self.execute_rebalancing()
+                    # Execute rebalancing (synchronous call)
+                    record = self.execute_rebalancing()
                     
                     if record:
                         logger.info(f"Rebalancing completed - Sharpe: {record.sharpe_ratio:.4f}")
@@ -597,8 +609,7 @@ class PortfolioService:
             self.config_observer.join()
             
         # Close API session
-        if hasattr(self.api_client, 'session'):
-            self.api_client.session.close()
+        await self.api_client.close()
             
         logger.info("Service shutdown complete")
 
