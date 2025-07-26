@@ -168,7 +168,7 @@ class SecureAPIClient:
         
     def _create_secure_ssl_context(self) -> ssl.SSLContext:
         """Create secure SSL context with strong protocol settings."""
-        # Fixed: Use explicit secure protocol for Python 3.10+ compliance
+        # Use explicit secure protocol for Python 3.10+ compliance
         if sys.version_info >= (3, 10):
             # Python 3.10+ uses secure defaults, but be explicit
             ssl_context = ssl.create_default_context()
@@ -536,7 +536,6 @@ class PortfolioService:
     def execute_rebalancing(self) -> Optional[RebalanceRecord]:
         """
         Execute portfolio rebalancing and create audit record.
-        Fixed: Removed async keyword since this function doesn't use async features.
         
         Returns:
             Rebalance record if successful, None otherwise
