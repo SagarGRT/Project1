@@ -196,8 +196,8 @@ class SecureAPIClient:
             
         return ssl_context
         
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create async HTTP session."""
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create async HTTP session. FIXED: Removed async keyword."""
         if self.session is None or self.session.closed:
             # Configure secure TLS
             ssl_context = self._create_secure_ssl_context()
@@ -245,7 +245,7 @@ class SecureAPIClient:
             aiohttp.ClientError: If API request fails
             ValueError: If response data is invalid
         """
-        session = await self._get_session()
+        session = self._get_session()  # FIXED: Removed await since _get_session is now synchronous
         
         try:
             timestamp = str(int(time.time()))
