@@ -63,6 +63,7 @@ import json
 import logging
 import os
 import ssl
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,7 +104,7 @@ class PortfolioConfig:
     optimization_objective: str = "max_sharpe"  # "max_sharpe" or "target_sharpe"
     target_sharpe_ratio: Optional[float] = None
     rolling_window_periods: int = 60
-    assets: Optional[List[str]] = None  # Fixed: Changed from List[str] = None to Optional[List[str]] = None
+    assets: Optional[List[str]] = None
     max_weight_per_asset: float = 0.4
     min_weight_per_asset: float = 0.05
     
@@ -165,18 +166,41 @@ class SecureAPIClient:
             raise ValueError(f"Required environment variable {key} not set")
         return value
         
+    def _create_secure_ssl_context(self) -> ssl.SSLContext:
+        """Create secure SSL context with strong protocol settings."""
+        # Fixed: Use explicit secure protocol for Python 3.10+ compliance
+        if sys.version_info >= (3, 10):
+            # Python 3.10+ uses secure defaults, but be explicit
+            ssl_context = ssl.create_default_context()
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
+        else:
+            # For older Python versions, explicitly set secure protocols
+            ssl_context = ssl.create_default_context()
+            ssl_context.options |= ssl.OP_NO_SSLv2
+            ssl_context.options |= ssl.OP_NO_SSLv3
+            ssl_context.options |= ssl.OP_NO_TLSv1
+            ssl_context.options |= ssl.OP_NO_TLSv1_1
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        
+        # Additional security settings
+        ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+        ssl_context.check_hostname = True
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        
+        # Optional client certificate authentication
+        cert_path = os.getenv('TLS_CERT_PATH')
+        key_path = os.getenv('TLS_KEY_PATH')
+        if cert_path and key_path:
+            ssl_context.load_cert_chain(cert_path, key_path)
+            
+        return ssl_context
+        
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create async HTTP session."""
         if self.session is None or self.session.closed:
-            # Configure TLS
-            ssl_context = ssl.create_default_context()
-            
-            # Optional client certificate authentication
-            cert_path = os.getenv('TLS_CERT_PATH')
-            key_path = os.getenv('TLS_KEY_PATH')
-            if cert_path and key_path:
-                ssl_context.load_cert_chain(cert_path, key_path)
-            
+            # Configure secure TLS
+            ssl_context = self._create_secure_ssl_context()
             connector = aiohttp.TCPConnector(ssl=ssl_context)
             
             # Set security headers
@@ -512,6 +536,7 @@ class PortfolioService:
     def execute_rebalancing(self) -> Optional[RebalanceRecord]:
         """
         Execute portfolio rebalancing and create audit record.
+        Fixed: Removed async keyword since this function doesn't use async features.
         
         Returns:
             Rebalance record if successful, None otherwise
