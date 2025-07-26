@@ -634,7 +634,7 @@ class PortfolioService:
             
         # Close API session
         await self.api_client.close()
-            
+        
         logger.info("Service shutdown complete")
 
 
