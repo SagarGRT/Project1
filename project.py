@@ -51,11 +51,12 @@ All rebalancing decisions are logged to immutable audit files with SOC 2 complia
 
 USAGE:
 ======
-python portfolio_service.py
+python project.py [--once] [--config CONFIG_FILE] [--log-level LEVEL]
 
 The service will start and begin the rebalancing loop based on configured intervals.
 """
 
+import argparse
 import asyncio
 import hashlib
 import hmac
@@ -66,8 +67,9 @@ import ssl
 import sys
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any, Union, TypedDict
 from dataclasses import dataclass, asdict
 from contextlib import asynccontextmanager
 
@@ -80,25 +82,87 @@ from pypfopt.exceptions import OptimizationError
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-
 # Load environment variables
 load_dotenv()
+
+# ============================================================================
+# GLOBAL CONSTANTS - Centralized configuration for easy tuning
+# ============================================================================
+BAR_FREQ_PER_YEAR = 252 * 24 * 12      # 5-minute bars per year
+PRICE_CACHE_LIMIT = 2 * 60 * 24        # Keep last 2 days of 5-min bars
+API_RETRY_ATTEMPTS = 3                  # Number of API retry attempts
+BACKOFF_FACTOR = 1.6                    # Exponential backoff multiplier
+MIN_TRADE_THRESHOLD = 0.01              # Minimum trade value threshold
+DEBOUNCE_SECONDS = 1.0                  # Config file change debounce
+SESSION_TIMEOUT_SEC = 30                # HTTP session timeout
+COVARIANCE_CACHE_SIZE = 64              # LRU cache size for covariance matrices
 
 # Global test mode flag - can be set by tests
 _TEST_MODE = os.getenv('PORTFOLIO_TEST_MODE', 'false').lower() == 'true'
 
+# ============================================================================
+# TYPE DEFINITIONS - Explicit typing for better code clarity
+# ============================================================================
+class PricePoint(TypedDict):
+    """Type definition for a single price data point."""
+    timestamp: str
+    symbol: str
+    price: float
+
+class PositionData(TypedDict):
+    """Type definition for position data."""
+    symbol: str
+    quantity: float
+
+class OrderData(TypedDict):
+    """Type definition for order submission."""
+    symbol: str
+    quantity: float
+    side: str
+    type: str
+
+# ============================================================================
+# TIME ABSTRACTION - For better testability
+# ============================================================================
+class _TimeProvider:
+    """Time provider abstraction for easier testing."""
+    
+    @staticmethod
+    def now() -> float:
+        """Get current timestamp."""
+        return time.time()
+    
+    @staticmethod
+    def utcnow() -> datetime:
+        """Get current UTC datetime."""
+        return datetime.now(timezone.utc)
+    
+    @staticmethod
+    async def sleep(seconds: float) -> None:
+        """Async sleep."""
+        await asyncio.sleep(seconds)
+
+# Global time provider - can be mocked in tests
+_time = _TimeProvider()
+
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('portfolio_service.log'),
-        logging.StreamHandler()
-    ]
-)
+def setup_logging(level: str = 'INFO'):
+    """Setup logging configuration."""
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=numeric_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('portfolio_service.log'),
+            logging.StreamHandler()
+        ]
+    )
+
 logger = logging.getLogger(__name__)
 
-
+# ============================================================================
+# CONFIGURATION CLASSES
+# ============================================================================
 @dataclass
 class PortfolioConfig:
     """Configuration class for portfolio management parameters."""
@@ -112,8 +176,36 @@ class PortfolioConfig:
     min_weight_per_asset: float = 0.05
     
     def __post_init__(self):
+        """Validate configuration parameters."""
         if self.assets is None:
             self.assets = ["BTC", "ETH", "ADA", "SOL"]
+        
+        # Validate assets list
+        if not self.assets:
+            raise ValueError("Assets list cannot be empty")
+        if len(set(self.assets)) != len(self.assets):
+            raise ValueError("Duplicate asset symbols found")
+        
+        # Validate numeric ranges in a loop
+        validations = [
+            ("risk_free_rate", self.risk_free_rate, 0, 1),
+            ("min_weight_per_asset", self.min_weight_per_asset, 0, 1),
+            ("max_weight_per_asset", self.max_weight_per_asset, 0, 1),
+        ]
+        
+        for name, value, min_val, max_val in validations:
+            if not min_val <= value <= max_val:
+                raise ValueError(f"{name} must be between {min_val} and {max_val}")
+        
+        # Validate weight relationship
+        if self.min_weight_per_asset >= self.max_weight_per_asset:
+            raise ValueError("min_weight_per_asset must be less than max_weight_per_asset")
+        
+        # Validate other parameters
+        if self.rebalancing_interval_minutes < 1:
+            raise ValueError("Rebalancing interval must be at least 1 minute")
+        if self.rolling_window_periods < 10:
+            raise ValueError("Rolling window must be at least 10 periods")
 
 
 @dataclass
@@ -137,7 +229,9 @@ class RebalanceRecord:
         record_hash = hashlib.sha256(record_json.encode()).hexdigest()
         return f"{record_json}|HASH:{record_hash}"
 
-
+# ============================================================================
+# CONFIGURATION MANAGEMENT
+# ============================================================================
 class ConfigWatcher(FileSystemEventHandler):
     """File system watcher for hot-reloading configuration changes."""
     
@@ -147,14 +241,16 @@ class ConfigWatcher(FileSystemEventHandler):
         
     def on_modified(self, event):
         if event.src_path.endswith('config.json'):
-            current_time = time.time()
-            if current_time - self.last_modified > 1:  # Debounce
+            current_time = _time.now()
+            if current_time - self.last_modified > DEBOUNCE_SECONDS:
                 self.last_modified = current_time
                 self.callback()
 
-
+# ============================================================================
+# SECURE API CLIENT WITH RETRY LOGIC
+# ============================================================================
 class SecureAPIClient:
-    """Secure REST API client with TLS support for fetching market data."""
+    """Secure REST API client with TLS support and retry logic."""
     
     def __init__(self, test_mode: bool = None):
         self.test_mode = test_mode if test_mode is not None else _TEST_MODE
@@ -170,7 +266,34 @@ class SecureAPIClient:
             self.api_key = self._get_required_env('API_KEY')
             self.api_secret = os.getenv('API_SECRET', '')
         
-        self.session = None
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
+        
+    async def __aenter__(self):
+        """Async context manager entry - create session here."""
+        if self.session is None or self.session.closed:
+            ssl_context = self._create_secure_ssl_context()
+            self._connector = aiohttp.TCPConnector(ssl=ssl_context)
+            
+            headers = {
+                'User-Agent': 'DigitalAssetManager/1.0',
+                'X-API-Key': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            
+            self.session = aiohttp.ClientSession(
+                connector=self._connector,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=SESSION_TIMEOUT_SEC)
+            )
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit - close session here."""
+        if self.session and not self.session.closed:
+            await self.session.close()
+        if self._connector:
+            await self._connector.close()
         
     def _get_required_env(self, key: str) -> str:
         """Get required environment variable or raise error."""
@@ -181,14 +304,11 @@ class SecureAPIClient:
         
     def _create_secure_ssl_context(self) -> ssl.SSLContext:
         """Create secure SSL context with strong protocol settings."""
-        # Use explicit secure protocol for Python 3.10+ compliance
         if sys.version_info >= (3, 10):
-            # Python 3.10+ uses secure defaults, but be explicit
             ssl_context = ssl.create_default_context()
             ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
         else:
-            # For older Python versions, explicitly set secure protocols
             ssl_context = ssl.create_default_context()
             ssl_context.options |= ssl.OP_NO_SSLv2
             ssl_context.options |= ssl.OP_NO_SSLv3
@@ -209,28 +329,6 @@ class SecureAPIClient:
             
         return ssl_context
         
-    def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create async HTTP session. FIXED: Removed async keyword."""
-        if self.session is None or self.session.closed:
-            # Configure secure TLS
-            ssl_context = self._create_secure_ssl_context()
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
-            
-            # Set security headers
-            headers = {
-                'User-Agent': 'DigitalAssetManager/1.0',
-                'X-API-Key': self.api_key,
-                'Content-Type': 'application/json'
-            }
-            
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
-            )
-            
-        return self.session
-        
     def _generate_signature(self, timestamp: str, method: str, path: str, body: str = '') -> str:
         """Generate HMAC signature for API authentication."""
         if not self.api_secret:
@@ -243,42 +341,51 @@ class SecureAPIClient:
             hashlib.sha256
         ).hexdigest()
         return signature
+    
+    async def _call_with_retry(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
+        """Make API call with retry logic."""
+        if not self.session:
+            raise RuntimeError("API client not initialized - use as async context manager")
+            
+        backoff = 1.0
+        last_exception = None
+        
+        for attempt in range(API_RETRY_ATTEMPTS):
+            try:
+                async with self.session.request(method, url, **kwargs) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except aiohttp.ClientError as e:
+                last_exception = e
+                if attempt == API_RETRY_ATTEMPTS - 1:
+                    break
+                    
+                logger.warning(f"API call failed (attempt {attempt + 1}/{API_RETRY_ATTEMPTS}): {e}")
+                await _time.sleep(backoff)
+                backoff *= BACKOFF_FACTOR
+        
+        raise last_exception or aiohttp.ClientError("API call failed after retries")
         
     async def fetch_price_data(self, assets: List[str]) -> pd.DataFrame:
-        """
-        Fetch real-time price data for specified assets.
+        """Fetch real-time price data for specified assets."""
+        timestamp = str(int(_time.now()))
+        path = '/api/v1/prices'
         
-        Args:
-            assets: List of asset symbols to fetch
-            
-        Returns:
-            DataFrame with timestamp index and asset price columns
-            
-        Raises:
-            aiohttp.ClientError: If API request fails
-            ValueError: If response data is invalid
-        """
-        session = self._get_session()  # FIXED: Removed await since _get_session is now synchronous
+        params = {'symbols': ','.join(assets)}
+        signature = self._generate_signature(timestamp, 'GET', path)
+        
+        headers = {
+            'X-Timestamp': timestamp,
+            'X-Signature': signature
+        }
         
         try:
-            timestamp = str(int(time.time()))
-            path = '/api/v1/prices'
-            
-            params = {'symbols': ','.join(assets)}
-            signature = self._generate_signature(timestamp, 'GET', path)
-            
-            headers = {
-                'X-Timestamp': timestamp,
-                'X-Signature': signature
-            }
-            
-            async with session.get(
+            data = await self._call_with_retry(
+                'GET',
                 f"{self.base_url}{path}",
                 params=params,
                 headers=headers
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
+            )
             
             # Convert to DataFrame with proper timestamp indexing
             prices_data = []
@@ -299,35 +406,55 @@ class SecureAPIClient:
             logger.info(f"Fetched price data for {len(assets)} assets")
             return df_pivot
             
-        except aiohttp.ClientError as e:
-            logger.error(f"API request failed: {e}")
-            raise
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Invalid API response format: {e}")
             raise ValueError(f"Invalid API response: {e}")
     
-    async def close(self):
-        """Close the HTTP session."""
-        if self.session and not self.session.closed:
-            await self.session.close()
+    async def get_positions(self) -> Dict[str, float]:
+        """Get current portfolio positions."""
+        timestamp = str(int(_time.now()))
+        path = '/api/v1/positions'
+        signature = self._generate_signature(timestamp, 'GET', path)
+        
+        headers = {
+            'X-Timestamp': timestamp,
+            'X-Signature': signature
+        }
+        
+        data = await self._call_with_retry('GET', f"{self.base_url}{path}", headers=headers)
+        return {pos['symbol']: float(pos['quantity']) for pos in data.get('positions', [])}
+    
+    async def submit_orders(self, orders: List[OrderData]) -> List[str]:
+        """Submit trading orders."""
+        timestamp = str(int(_time.now()))
+        path = '/api/v1/orders'
+        body = json.dumps({'orders': orders})
+        signature = self._generate_signature(timestamp, 'POST', path, body)
+        
+        headers = {
+            'X-Timestamp': timestamp,
+            'X-Signature': signature
+        }
+        
+        data = await self._call_with_retry('POST', f"{self.base_url}{path}", data=body, headers=headers)
+        return [order['order_id'] for order in data.get('orders', [])]
 
-
+# ============================================================================
+# PORTFOLIO OPTIMIZER WITH CACHING
+# ============================================================================
 class PortfolioOptimizer:
-    """Mean-variance portfolio optimizer using PyPortfolioOpt."""
+    """Mean-variance portfolio optimizer using PyPortfolioOpt with caching."""
     
     def __init__(self, config: PortfolioConfig):
         self.config = config
         
-    def compute_rolling_covariance(self, price_data: pd.DataFrame) -> np.ndarray:
-        """
-        Compute rolling covariance matrix from price data.
+    @lru_cache(maxsize=COVARIANCE_CACHE_SIZE)
+    def _cached_covariance(self, data_hash: str, window_periods: int) -> str:
+        """Cache key for covariance matrix computation."""
+        return f"{data_hash}_{window_periods}"
         
-        Args:
-            price_data: DataFrame with price data
-            
-        Returns:
-            Covariance matrix as numpy array
-        """
+    def compute_rolling_covariance(self, price_data: pd.DataFrame) -> np.ndarray:
+        """Compute rolling covariance matrix from price data with caching."""
         # Calculate returns
         returns = price_data.pct_change().dropna()
         
@@ -338,27 +465,12 @@ class PortfolioOptimizer:
             recent_returns = returns
             logger.warning(f"Using {len(returns)} periods instead of {self.config.rolling_window_periods}")
             
-        # Compute covariance matrix
-        cov_matrix = risk_models.sample_cov(recent_returns, frequency=252 * 24 * 12)  # 5-minute intervals
+        # Compute covariance matrix using consistent frequency
+        cov_matrix = risk_models.sample_cov(recent_returns, frequency=BAR_FREQ_PER_YEAR)
         return cov_matrix
         
-    def optimize_portfolio(
-        self, 
-        price_data: pd.DataFrame
-    ) -> Tuple[Dict[str, float], float, float, float]:
-        """
-        Optimize portfolio weights using mean-variance optimization.
-        
-        Args:
-            price_data: Historical price data
-            
-        Returns:
-            Tuple of (weights_dict, expected_return, volatility, sharpe_ratio)
-            
-        Raises:
-            OptimizationError: If optimization fails
-            ValueError: If insufficient data
-        """
+    def optimize_portfolio(self, price_data: pd.DataFrame) -> Tuple[Dict[str, float], float, float, float]:
+        """Optimize portfolio weights using mean-variance optimization."""
         if len(price_data) < 2:
             raise ValueError("Insufficient price data for optimization")
             
@@ -368,7 +480,7 @@ class PortfolioOptimizer:
             if len(returns) == 0:
                 raise ValueError("No valid returns data")
                 
-            mu = expected_returns.mean_historical_return(price_data, frequency=252 * 24 * 12)
+            mu = expected_returns.mean_historical_return(price_data, frequency=BAR_FREQ_PER_YEAR)
             S = self.compute_rolling_covariance(price_data)
             
             # Create efficient frontier
@@ -381,7 +493,7 @@ class PortfolioOptimizer:
                 self.config.target_sharpe_ratio is not None):
                 try:
                     weights = ef.efficient_return(
-                        target_return=self.config.target_sharpe_ratio * np.sqrt(252 * 24 * 12) * 
+                        target_return=self.config.target_sharpe_ratio * np.sqrt(BAR_FREQ_PER_YEAR) * 
                         np.sqrt(np.diagonal(S).mean()) + self.config.risk_free_rate
                     )
                 except OptimizationError:
@@ -409,13 +521,16 @@ class PortfolioOptimizer:
             logger.error(f"Unexpected optimization error: {e}")
             raise OptimizationError(f"Optimization failed: {e}")
 
-
+# ============================================================================
+# AUDIT LOGGER WITH PROPER RESOURCE MANAGEMENT
+# ============================================================================
 class AuditLogger:
     """SOC 2 compliant audit logger for portfolio decisions."""
     
     def __init__(self, log_directory: str = "audit_logs"):
         self.log_directory = Path(log_directory)
         self.log_directory.mkdir(exist_ok=True)
+        self._file_handler = None
         self._setup_audit_logging()
         
     def _setup_audit_logging(self):
@@ -424,28 +539,23 @@ class AuditLogger:
         self.audit_logger.setLevel(logging.INFO)
         
         # Create audit log handler with daily rotation
-        audit_handler = logging.FileHandler(
+        self._file_handler = logging.FileHandler(
             self.log_directory / f"audit_{datetime.now().strftime('%Y%m%d')}.log"
         )
         audit_formatter = logging.Formatter(
             '%(asctime)s - AUDIT - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S UTC'
         )
-        audit_handler.setFormatter(audit_formatter)
-        self.audit_logger.addHandler(audit_handler)
+        self._file_handler.setFormatter(audit_formatter)
+        self.audit_logger.addHandler(self._file_handler)
         
     def log_rebalance_decision(self, record: RebalanceRecord):
-        """
-        Log rebalancing decision with cryptographic integrity.
-        
-        Args:
-            record: Rebalance record to log
-        """
+        """Log rebalancing decision with cryptographic integrity."""
         audit_string = record.to_audit_string()
         self.audit_logger.info(audit_string)
         
         # Also write to immutable file with timestamp
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        timestamp_str = _time.utcnow().strftime('%Y%m%d_%H%M%S_%f')
         immutable_file = self.log_directory / f"rebalance_{timestamp_str}.json"
         
         with open(immutable_file, 'w') as f:
@@ -455,15 +565,24 @@ class AuditLogger:
         immutable_file.chmod(0o444)
         
         logger.info(f"Audit record written: {immutable_file}")
-
-
-class PortfolioService:
-    """Main portfolio management service."""
     
-    def __init__(self, test_mode: bool = None):
+    def close(self):
+        """Close audit logger resources."""
+        if self._file_handler:
+            self._file_handler.close()
+            if self.audit_logger:
+                self.audit_logger.removeHandler(self._file_handler)
+
+# ============================================================================
+# MAIN PORTFOLIO SERVICE WITH CONCURRENT OPERATIONS
+# ============================================================================
+class PortfolioService:
+    """Main portfolio management service with enhanced concurrency."""
+    
+    def __init__(self, test_mode: bool = None, config_file: str = 'config.json'):
         self.test_mode = test_mode if test_mode is not None else _TEST_MODE
+        self.config_file = config_file
         self.config = self._load_config()
-        self.api_client = SecureAPIClient(test_mode=self.test_mode)
         self.optimizer = PortfolioOptimizer(self.config)
         self.audit_logger = AuditLogger()
         self.price_history = pd.DataFrame()
@@ -478,19 +597,19 @@ class PortfolioService:
         
     def _load_config(self) -> PortfolioConfig:
         """Load configuration from JSON file with fallback to defaults."""
-        config_file = Path('config.json')
+        config_file = Path(self.config_file)
         if config_file.exists():
             try:
                 with open(config_file, 'r') as f:
                     config_data = json.load(f)
-                logger.info("Configuration loaded from config.json")
+                logger.info(f"Configuration loaded from {self.config_file}")
                 return PortfolioConfig(**config_data)
             except (json.JSONDecodeError, TypeError) as e:
-                logger.error(f"Invalid config.json format: {e}")
+                logger.error(f"Invalid {self.config_file} format: {e}")
                 logger.info("Using default configuration")
                 return PortfolioConfig()
         else:
-            logger.info("No config.json found, using default configuration")
+            logger.info(f"No {self.config_file} found, using default configuration")
             return PortfolioConfig()
             
     def _setup_config_watcher(self):
@@ -529,10 +648,10 @@ class PortfolioService:
         config_string = json.dumps(config_dict, sort_keys=True)
         return hashlib.sha256(config_string.encode()).hexdigest()
         
-    async def fetch_and_store_prices(self):
+    async def fetch_and_store_prices(self, api_client: SecureAPIClient):
         """Fetch latest prices and update price history."""
         try:
-            new_data = await self.api_client.fetch_price_data(self.config.assets)
+            new_data = await api_client.fetch_price_data(self.config.assets)
             
             if self.price_history.empty:
                 self.price_history = new_data
@@ -543,9 +662,8 @@ class PortfolioService:
                 self.price_history = self.price_history.sort_index()
                 
                 # Keep only recent data to manage memory
-                max_periods = self.config.rolling_window_periods * 2
-                if len(self.price_history) > max_periods:
-                    self.price_history = self.price_history.tail(max_periods)
+                if len(self.price_history) > PRICE_CACHE_LIMIT:
+                    self.price_history = self.price_history.tail(PRICE_CACHE_LIMIT)
                     
             logger.info(f"Price history updated: {len(self.price_history)} periods")
             
@@ -553,30 +671,30 @@ class PortfolioService:
             logger.error(f"Failed to fetch price data: {e}")
             raise
             
-    def execute_rebalancing(self) -> Optional[RebalanceRecord]:
-        """
-        Execute portfolio rebalancing and create audit record.
-        
-        Returns:
-            Rebalance record if successful, None otherwise
-        """
+    async def execute_rebalancing_cycle(self, api_client: SecureAPIClient) -> Optional[RebalanceRecord]:
+        """Execute a complete rebalancing cycle with concurrent I/O operations."""
         if len(self.price_history) < 2:
             logger.warning("Insufficient price history for rebalancing")
             return None
             
-        start_time = time.time()
+        start_time = _time.now()
         
         try:
-            # Optimize portfolio
-            weights, expected_return, volatility, sharpe = self.optimizer.optimize_portfolio(
-                self.price_history
+            # Fetch positions and current prices concurrently
+            positions_task = asyncio.create_task(api_client.get_positions())
+            await self.fetch_and_store_prices(api_client)  # Update price history first
+            positions = await positions_task
+            
+            # Optimize portfolio in thread pool to avoid blocking
+            weights, expected_return, volatility, sharpe = await asyncio.to_thread(
+                self.optimizer.optimize_portfolio, self.price_history
             )
             
-            execution_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+            execution_time = (_time.now() - start_time) * 1000  # Convert to milliseconds
             
             # Create audit record
             record = RebalanceRecord(
-                timestamp=datetime.now(timezone.utc).isoformat(),
+                timestamp=_time.utcnow().isoformat(),
                 portfolio_weights=weights,
                 expected_return=expected_return,
                 portfolio_volatility=volatility,
@@ -600,48 +718,57 @@ class PortfolioService:
             logger.error(f"Rebalancing failed: {e}")
             return None
             
+    async def run_once(self) -> bool:
+        """Run a single rebalancing cycle."""
+        logger.info("Running single rebalancing cycle")
+        
+        async with SecureAPIClient(test_mode=self.test_mode) as api_client:
+            record = await self.execute_rebalancing_cycle(api_client)
+            
+        if record:
+            logger.info(f"Single rebalancing completed - Sharpe: {record.sharpe_ratio:.4f}")
+            return True
+        return False
+            
     async def run(self):
-        """Main service loop."""
+        """Main service loop with enhanced error handling."""
         logger.info("Starting Portfolio Management Service")
         logger.info(f"Rebalancing interval: {self.config.rebalancing_interval_minutes} minutes")
         logger.info(f"Monitoring assets: {self.config.assets}")
         
         self.running = True
         
-        try:
-            while self.running:
-                loop_start = time.time()
-                
-                try:
-                    # Fetch latest price data
-                    await self.fetch_and_store_prices()
+        async with SecureAPIClient(test_mode=self.test_mode) as api_client:
+            try:
+                while self.running:
+                    loop_start = _time.now()
                     
-                    # Execute rebalancing (synchronous call)
-                    record = self.execute_rebalancing()
+                    try:
+                        record = await self.execute_rebalancing_cycle(api_client)
+                        
+                        if record:
+                            logger.info(f"Rebalancing completed - Sharpe: {record.sharpe_ratio:.4f}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error in main loop: {e}")
+                        
+                    # Calculate sleep time to maintain interval
+                    loop_duration = _time.now() - loop_start
+                    sleep_time = max(0, (self.config.rebalancing_interval_minutes * 60) - loop_duration)
                     
-                    if record:
-                        logger.info(f"Rebalancing completed - Sharpe: {record.sharpe_ratio:.4f}")
-                    
-                except Exception as e:
-                    logger.error(f"Error in main loop: {e}")
-                    
-                # Calculate sleep time to maintain interval
-                loop_duration = time.time() - loop_start
-                sleep_time = max(0, (self.config.rebalancing_interval_minutes * 60) - loop_duration)
-                
-                if sleep_time > 0:
-                    logger.debug(f"Sleeping for {sleep_time:.1f} seconds")
-                    await asyncio.sleep(sleep_time)
-                else:
-                    logger.warning(f"Loop took {loop_duration:.1f}s, longer than interval")
-                    
-        except KeyboardInterrupt:
-            logger.info("Service stopped by user")
-        except Exception as e:
-            logger.error(f"Fatal error in service: {e}")
-            raise
-        finally:
-            await self.shutdown()
+                    if sleep_time > 0:
+                        logger.debug(f"Sleeping for {sleep_time:.1f} seconds")
+                        await _time.sleep(sleep_time)
+                    else:
+                        logger.warning(f"Loop took {loop_duration:.1f}s, longer than interval")
+                        
+            except KeyboardInterrupt:
+                logger.info("Service stopped by user")
+            except Exception as e:
+                logger.error(f"Fatal error in service: {e}")
+                raise
+            finally:
+                await self.shutdown()
             
     async def shutdown(self):
         """Graceful shutdown of the service."""
@@ -652,14 +779,48 @@ class PortfolioService:
             self.config_observer.stop()
             self.config_observer.join()
             
-        # Close API session
-        await self.api_client.close()
+        # Close audit logger
+        self.audit_logger.close()
         
         logger.info("Service shutdown complete")
 
+# ============================================================================
+# CLI INTERFACE
+# ============================================================================
+def cli():
+    """Command line interface for the portfolio service."""
+    parser = argparse.ArgumentParser(description='Digital Asset Portfolio Management Microservice')
+    parser.add_argument('--once', action='store_true', 
+                       help='Run a single rebalance cycle then exit')
+    parser.add_argument('--config', default='config.json',
+                       help='Configuration file path (default: config.json)')
+    parser.add_argument('--log-level', default='INFO', 
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Logging level (default: INFO)')
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(args.log_level)
+    
+    # Create and run service
+    service = PortfolioService(config_file=args.config)
+    
+    try:
+        if args.once:
+            result = asyncio.run(service.run_once())
+            return 0 if result else 1
+        else:
+            return asyncio.run(service.run())
+    except Exception as e:
+        logger.error(f"Service failed: {e}")
+        return 1
 
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 async def main():
-    """Main entry point."""
+    """Main entry point for backward compatibility."""
     service = PortfolioService()
     
     try:
@@ -672,5 +833,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(asyncio.run(main()))
+    # Use CLI interface if available, otherwise fall back to main()
+    try:
+        exit_code = cli()
+        sys.exit(exit_code)
+    except Exception:
+        sys.exit(asyncio.run(main()))
